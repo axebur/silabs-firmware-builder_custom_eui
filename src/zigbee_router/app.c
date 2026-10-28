@@ -34,6 +34,8 @@
 #include "network-steering.h"
 #include "find-and-bind-target.h"
 #include "sl_cli_handles.h"
+#include "sl_token_api.h"
+#include <string.h>
 
 #ifdef SL_CATALOG_ZIGBEE_ZLL_COMMISSIONING_COMMON_PRESENT
 #include "zll-commissioning.h"
@@ -61,6 +63,160 @@ static sl_zigbee_af_event_t commissioning_led_event;
 static sl_zigbee_af_event_t finding_and_binding_event;
 
 //---------------
+// Custom EUI64 helpers
+
+static bool is_valid_custom_eui64(const sl_802154_long_addr_t eui64)
+{
+  bool all_ff = true;
+  bool all_00 = true;
+
+  for (size_t i = 0; i < EUI64_SIZE; i++) {
+    if (eui64[i] != 0xFF) {
+      all_ff = false;
+    }
+    if (eui64[i] != 0x00) {
+      all_00 = false;
+    }
+  }
+
+  return !all_ff && !all_00;
+}
+
+static void print_eui64_be(const char *label, const sl_802154_long_addr_t eui64)
+{
+  printf("%s: %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X\n",
+         label,
+         eui64[7], eui64[6], eui64[5], eui64[4],
+         eui64[3], eui64[2], eui64[1], eui64[0]);
+}
+
+static int hex_nibble(char c)
+{
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  }
+  if (c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
+  return -1;
+}
+
+static bool parse_eui64_be_str(const char *str, sl_802154_long_addr_t out_le)
+{
+  if (str == NULL) {
+    return false;
+  }
+
+  if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+    str += 2;
+  }
+
+  uint8_t bytes_be[EUI64_SIZE];
+  size_t byte_idx = 0;
+
+  while (*str != '\0') {
+    if (*str == ':' || *str == '-') {
+      str++;
+      continue;
+    }
+
+    if (byte_idx >= EUI64_SIZE) {
+      return false;
+    }
+
+    int hi = hex_nibble(str[0]);
+    int lo = hex_nibble(str[1]);
+    if (hi < 0 || lo < 0) {
+      return false;
+    }
+
+    bytes_be[byte_idx++] = (uint8_t)((hi << 4) | lo);
+    str += 2;
+  }
+
+  if (byte_idx != EUI64_SIZE) {
+    return false;
+  }
+
+  for (size_t i = 0; i < EUI64_SIZE; i++) {
+    out_le[i] = bytes_be[EUI64_SIZE - 1 - i];
+  }
+
+  return is_valid_custom_eui64(out_le);
+}
+
+static bool get_configured_custom_eui64(sl_802154_long_addr_t out_eui64)
+{
+  sl_802154_long_addr_t restored_eui64;
+  memset(restored_eui64, 0xFF, sizeof(restored_eui64));
+  halCommonGetToken(&restored_eui64, TOKEN_STACK_RESTORED_EUI64);
+
+  if (is_valid_custom_eui64(restored_eui64)) {
+    memcpy(out_eui64, restored_eui64, EUI64_SIZE);
+    return true;
+  }
+
+  sl_802154_long_addr_t mfg_eui64;
+  memset(mfg_eui64, 0xFF, sizeof(mfg_eui64));
+  halCommonGetMfgToken(&mfg_eui64, TOKEN_MFG_CUSTOM_EUI_64);
+
+  if (is_valid_custom_eui64(mfg_eui64)) {
+    memcpy(out_eui64, mfg_eui64, EUI64_SIZE);
+    return true;
+  }
+
+  return false;
+}
+
+static void ensure_custom_eui64_and_router_state(void)
+{
+  tokTypeStackNodeData node_data;
+  memset(&node_data, 0xFF, sizeof(node_data));
+  halCommonGetToken(&node_data, TOKEN_STACK_NODE_DATA);
+
+  // If NVRAM still holds coordinator/non-router network state (for example when
+  // repurposing a former coordinator as a router), factory-reset stack tokens
+  // while preserving any custom EUI64 stored in NVM3/USERDATA.
+  if (node_data.panId != 0xFFFF
+      && node_data.nodeType != SL_ZIGBEE_ROUTER
+      && node_data.nodeType != SL_ZIGBEE_UNKNOWN_DEVICE) {
+    sl_802154_long_addr_t saved_eui64;
+    bool has_custom = get_configured_custom_eui64(saved_eui64);
+
+    sl_zigbee_token_factory_reset(true, true);
+
+    if (has_custom) {
+      halCommonSetToken(TOKEN_STACK_RESTORED_EUI64, &saved_eui64);
+    }
+
+    halReboot();
+  }
+
+  // Ensure a custom EUI64 from NVM3 (TOKEN_STACK_RESTORED_EUI64) or USERDATA
+  // (TOKEN_MFG_CUSTOM_EUI_64) is active as the local node EUI64.
+  sl_802154_long_addr_t custom_eui64;
+  if (get_configured_custom_eui64(custom_eui64)) {
+    sl_802154_long_addr_t restored_eui64;
+    memset(restored_eui64, 0xFF, sizeof(restored_eui64));
+    halCommonGetToken(&restored_eui64, TOKEN_STACK_RESTORED_EUI64);
+
+    // Mirror USERDATA custom EUI64 into TOKEN_STACK_RESTORED_EUI64 if not set
+    // yet so sl_zigbee_get_restored_eui64() always supplies it at stack init.
+    if (!is_valid_custom_eui64(restored_eui64)) {
+      halCommonSetToken(TOKEN_STACK_RESTORED_EUI64, &custom_eui64);
+    }
+
+    if (memcmp(sl_zigbee_get_eui64(), custom_eui64, EUI64_SIZE) != 0) {
+      memcpy(sl_zigbee_get_eui64(), custom_eui64, EUI64_SIZE);
+      halReboot();
+    }
+  }
+}
+
+//---------------
 // Custom CLI Commands
 
 typedef struct {
@@ -81,6 +237,7 @@ gecko_version_t parse_version(uint32_t version){
 
 void bootloader_info(sl_cli_command_arg_t *arguments)
 {
+  (void)arguments;
   char version_str[16];
   BootloaderInformation_t info = { .type = SL_BOOTLOADER, .version = 0L, .capabilities = 0L };
 
@@ -96,7 +253,55 @@ void bootloader_info(sl_cli_command_arg_t *arguments)
 
 void bootloader_reboot(sl_cli_command_arg_t *arguments)
 {
+  (void)arguments;
   bootloader_rebootAndInstall();
+}
+
+void eui64_info_cmd(sl_cli_command_arg_t *arguments)
+{
+  (void)arguments;
+  sl_802154_long_addr_t restored_eui64;
+  sl_802154_long_addr_t mfg_eui64;
+  sl_802154_long_addr_t hw_eui64;
+
+  memset(restored_eui64, 0xFF, sizeof(restored_eui64));
+  memset(mfg_eui64, 0xFF, sizeof(mfg_eui64));
+  memset(hw_eui64, 0xFF, sizeof(hw_eui64));
+
+  halCommonGetToken(&restored_eui64, TOKEN_STACK_RESTORED_EUI64);
+  halCommonGetMfgToken(&mfg_eui64, TOKEN_MFG_CUSTOM_EUI_64);
+  halCommonGetMfgToken(&hw_eui64, TOKEN_MFG_EMBER_EUI_64);
+
+  print_eui64_be("Active EUI64", sl_zigbee_get_eui64());
+  print_eui64_be("NVM3 Restored EUI64", restored_eui64);
+  print_eui64_be("USERDATA Custom EUI64", mfg_eui64);
+  print_eui64_be("Hardware EUI64", hw_eui64);
+}
+
+void eui64_set_cmd(sl_cli_command_arg_t *arguments)
+{
+  const char *eui_str = sl_cli_get_argument_string(arguments, 0);
+  sl_802154_long_addr_t new_eui64;
+
+  if (!parse_eui64_be_str(eui_str, new_eui64)) {
+    printf("Invalid EUI64. Expected 8 hex bytes, e.g. 00:11:22:33:44:55:66:77\n");
+    return;
+  }
+
+  halCommonSetToken(TOKEN_STACK_RESTORED_EUI64, &new_eui64);
+  print_eui64_be("Saved custom EUI64 to NVM3, rebooting", new_eui64);
+  halReboot();
+}
+
+void eui64_reset_cmd(sl_cli_command_arg_t *arguments)
+{
+  (void)arguments;
+  sl_802154_long_addr_t blank_eui64;
+  memset(blank_eui64, 0xFF, sizeof(blank_eui64));
+
+  halCommonSetToken(TOKEN_STACK_RESTORED_EUI64, &blank_eui64);
+  printf("Cleared NVM3 custom EUI64, rebooting\n");
+  halReboot();
 }
 
 static const sl_cli_command_info_t cmd__btl_info = \
@@ -120,9 +325,38 @@ static const sl_cli_command_entry_t btl_group_table[] = {
 sl_cli_command_info_t cli_cmd_btl_group = \
   SL_CLI_COMMAND_GROUP(btl_group_table, "Bootloader commands");
 
+static const sl_cli_command_info_t cmd__eui64_info = \
+  SL_CLI_COMMAND(eui64_info_cmd,
+                 "Print active, NVM3, USERDATA and hardware EUI64",
+                 "none",
+                 {SL_CLI_ARG_END, });
+
+static const sl_cli_command_info_t cmd__eui64_set = \
+  SL_CLI_COMMAND(eui64_set_cmd,
+                 "Set custom EUI64 in NVM3 and reboot",
+                 "EUI64 in big-endian hex" SL_CLI_UNIT_SEPARATOR,
+                 {SL_CLI_ARG_STRING, SL_CLI_ARG_END, });
+
+static const sl_cli_command_info_t cmd__eui64_reset = \
+  SL_CLI_COMMAND(eui64_reset_cmd,
+                 "Clear custom EUI64 in NVM3 and reboot",
+                 "none",
+                 {SL_CLI_ARG_END, });
+
+static const sl_cli_command_entry_t eui64_group_table[] = {
+    { "info", &cmd__eui64_info, false },
+    { "set", &cmd__eui64_set, false },
+    { "reset", &cmd__eui64_reset, false },
+    { NULL, NULL, false },
+};
+
+sl_cli_command_info_t cli_cmd_eui64_group = \
+  SL_CLI_COMMAND_GROUP(eui64_group_table, "Custom EUI64 commands");
+
 // Create root command table
 const sl_cli_command_entry_t sl_cli_btl_command_table[] = {
   { "bootloader", &cli_cmd_btl_group, false },
+  { "eui64", &cli_cmd_eui64_group, false },
   { NULL, NULL, false },
 };
 
@@ -156,6 +390,7 @@ static void sync_on_off_cluster(uint8_t endpoint){
 
 static void commissioning_led_event_handler(sl_zigbee_af_event_t *event)
 {
+  (void)event;
   if (sl_zigbee_af_network_state() == SL_ZIGBEE_JOINED_NETWORK) {
     uint16_t identifyTime;
     sl_zigbee_af_read_server_attribute(LIGHT_ENDPOINT,
@@ -178,6 +413,7 @@ static void commissioning_led_event_handler(sl_zigbee_af_event_t *event)
 
 static void finding_and_binding_event_handler(sl_zigbee_af_event_t *event)
 {
+  (void)event;
   if (sl_zigbee_af_network_state() == SL_ZIGBEE_JOINED_NETWORK) {
     sl_zigbee_af_event_set_inactive(&finding_and_binding_event);
 
@@ -216,12 +452,14 @@ void sl_zigbee_af_stack_status_cb(sl_status_t status)
  */
 void sl_zigbee_af_main_init_cb(void)
 {
+  ensure_custom_eui64_and_router_state();
+
   sl_zigbee_af_event_init(&commissioning_led_event, commissioning_led_event_handler);
   sl_zigbee_af_isr_event_init(&finding_and_binding_event, finding_and_binding_event_handler);
 
   sl_zigbee_af_event_set_active(&commissioning_led_event);
 
-  // Custom bootloader CLI commands
+  // Custom bootloader and EUI64 CLI commands
   sl_cli_command_add_command_group(sl_cli_bootloader_handle, &sl_cli_btl_command_group);
 }
 
@@ -248,6 +486,9 @@ void sl_zigbee_af_network_steering_complete_cb(sl_status_t status,
                                                uint8_t joinAttempts,
                                                uint8_t finalState)
 {
+  (void)totalBeacons;
+  (void)joinAttempts;
+  (void)finalState;
   sl_zigbee_app_debug_println("Join network complete: 0x%X", status);
 
   if (status != SL_STATUS_OK) {
@@ -281,6 +522,10 @@ void sl_zigbee_af_post_attribute_change_cb(uint8_t endpoint,
                                            uint8_t size,
                                            uint8_t* value)
 {
+  (void)manufacturerCode;
+  (void)type;
+  (void)size;
+  (void)value;
   if (clusterId == ZCL_ON_OFF_CLUSTER_ID
       && attributeId == ZCL_ON_OFF_ATTRIBUTE_ID
       && mask == CLUSTER_MASK_SERVER) {
@@ -295,6 +540,7 @@ void sl_zigbee_af_post_attribute_change_cb(uint8_t endpoint,
 void sl_zigbee_af_identify_start_feedback_cb(uint8_t endpoint,
                                              uint16_t identifyTime)
 {
+  (void)endpoint;
   sl_zigbee_app_debug_println("Identify start: endpoint=%d, time=%d",
                               endpoint, identifyTime);
   if (identifyTime > 0 && identifyTime < 60) {
@@ -307,6 +553,7 @@ void sl_zigbee_af_identify_start_feedback_cb(uint8_t endpoint,
 
 void sl_zigbee_af_identify_stop_feedback_cb(uint8_t endpoint)
 {
+  (void)endpoint;
   sl_zigbee_app_debug_println("Identify stop: endpoint=%d", endpoint);
 }
 /** @brief On/off Cluster Server Post Init

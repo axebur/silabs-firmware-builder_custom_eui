@@ -61,9 +61,12 @@ jobs:
           image_name=$head_image
           build_image=true
 
-          # Check if we can use the base image (Nabu Casa)
+          # Check if we can use the base image (Nabu Casa) or upstream prebuilt image
           if docker manifest inspect ${{ env.REGISTRY }}/$base_image:$tag_name; then
             image_name=$base_image
+            build_image=false
+          elif docker manifest inspect ${{ env.REGISTRY }}/darkxst/silabs-firmware-builder:$tag_name; then
+            image_name=darkxst/silabs-firmware-builder
             build_image=false
           fi
 
