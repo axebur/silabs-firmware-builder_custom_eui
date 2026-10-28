@@ -13,7 +13,7 @@ If you are looking for Gecko v7 builds, they can be found here
 [Legacy Gecko SDK builds](https://github.com/darkxst/silabs-firmware-builder/tree/main/firmware_builds)
 
 ## Supported hardware:
-* Sonoff ZBDongle-E by ITead (based on EFR32MG21)
+* Sonoff ZBDongle-E by ITead (based on EFR32MG21) – includes Zigbee NCP, Zigbee Router (`manifests/sonoff/zbdonglee_zigbee_router.yaml`), and OpenThread RCP
 * Sonoff Dongle Plus Mg24 (based on EFR32MG24)
 * Sonoff iHost by ITead (also based on EFR32MG21 and uses the same firmware as Sonoff ZBDongle-E)
 * EasyIot ZB-GW04 v1.1 and v1.2 (based on EFR32MG21)
@@ -31,9 +31,10 @@ If you are looking for Gecko v7 builds, they can be found here
 
 ## Different firmware variants
 
-Three network protocol application firmware variants are available:
+Four network protocol application firmware variants are available:
 
 * **EmberZNet NCP** = Zigbee NCP (Network Co-Processor) is used as a dedicated Zigbee Coordinator for Zigbee-only environments, for direct use with Zigbee2MQTT, Home Assistant's ZHA integration, other Zigpy based Zigbee Gateway implementations, or other Zigbee gateways/frameworks that support the EZSP (EmberZNet Serial Protocol) interface.
+* **Zigbee Router** = Dedicated Zigbee 3.0 Router / repeater firmware (`src/zigbee_router`) with full support for custom EUI64 (IEEE) addresses stored in NVM3 or `USERDATA`, as well as interactive serial CLI commands for viewing/changing the EUI64 and managing network steering.
 * **OpenThread RCP** firmware (experimental) = This [Thread](https://en.wikipedia.org/wiki/Thread_(network_protocol)) RCP (Radio Co-Processor) is used directly as a dedicated Thread Border Router in Thread-only environments, used for [OpenThread Border Router add-on](https://github.com/home-assistant/addons/blob/master/openthread_border_router/DOCS.md) or wpantund.
 * **RCP Multi-PAN** (no longer recommended) = Multiprotocol firmware for concurrent communication over Zigbee and Thread via Home Assistant [SiliconLabs Multiprotocol add-on](https://github.com/home-assistant/addons/blob/master/silabs-multiprotocol/DOCS.md).
 
@@ -66,6 +67,46 @@ Firmware builds can be found in the [firmware_builds](https://github.com/darkxst
 ZBDongle-E and ZB-GW04 v1.1 do not support hardware flow control. Yellow, SkyConnect and ZB-GW04 v1.2 are built with hardware flow control. Various baudrates are available as listed at the end of the filename.
 
 Use NabuCasa's [Universal-Silabs-Flasher](https://github.com/NabuCasa/universal-silabs-flasher) to flash the `.gbl` files.
+
+
+## Zigbee Router with Custom EUI64 (IEEE Address) Support
+
+When migrating a Zigbee network to a new Coordinator by cloning the old adapter's IEEE/EUI64 address, the old adapter cannot join the network as a Zigbee Router unless its EUI64 address is changed.
+
+Standard Silicon Labs Zigbee Router firmware ignores custom EUI64 addresses stored in NVM3 (`TOKEN_STACK_RESTORED_EUI64`) and always falls back to the factory hardware address (`TOKEN_MFG_EMBER_EUI_64` in `DEVINFO`). In this repository, `src/zigbee_router` has been extended to support custom EUI64 addresses and includes a dedicated build manifest for the **SONOFF ZBDongle-E** (`manifests/sonoff/zbdonglee_zigbee_router.yaml`).
+
+### How Custom EUI64 Resolution Works
+1. **Priority order on boot (`sl_zigbee_get_restored_eui64`)**:
+   1. **NVM3 Restored EUI64 (`TOKEN_STACK_RESTORED_EUI64` / `0x1E12A`)**: Written by tools such as `universal-silabs-flasher write-ieee`, `bellows`, `ember-zli`, or the router's built-in `eui64 set` serial CLI command.
+   2. **USERDATA Custom EUI64 (`TOKEN_MFG_CUSTOM_EUI_64`)**: Written to the `USERDATA` flash page via Simplicity Commander or bootloader. If present, it is also mirrored into `TOKEN_STACK_RESTORED_EUI64` in NVM3.
+   3. **Factory Hardware EUI64 (`TOKEN_MFG_EMBER_EUI_64` in `DEVINFO`)**: Used only if neither custom token contains a valid address (i.e. not `FF:FF:FF:FF:FF:FF:FF:FF` and not `00:00:00:00:00:00:00:00`).
+2. **Automatic Coordinator-to-Router NVRAM Cleanup**:
+   - If the adapter previously ran Coordinator (NCP) firmware and still has non-router network data in `TOKEN_STACK_NODE_DATA` (`nodeType != SL_ZIGBEE_ROUTER`), the router firmware automatically resets `TOKEN_STACK_NODE_DATA` on first boot while preserving the custom EUI64 in `TOKEN_STACK_RESTORED_EUI64`.
+
+### Router Serial CLI Commands (`115200` baud, 8N1)
+Connect to the router's USB serial port at `115200` baud (no flow control) using any serial terminal (e.g. PuTTY, screen, or Chrome Serial Terminal) to inspect or change the EUI64 directly on the running router firmware:
+
+| Command | Description |
+| :--- | :--- |
+| `eui64 info` | Prints the `Active EUI64`, `NVM3 Restored EUI64`, `USERDATA Custom EUI64`, and `Hardware EUI64`. |
+| `eui64 set <EUI64>` | Saves a new custom EUI64 (e.g. `eui64 set 00:12:4B:00:29:AA:BB:CC`) to NVM3 and reboots. |
+| `eui64 reset` | Clears the custom EUI64 in NVM3 (`FF:FF:FF:FF:FF:FF:FF:FF`) and reboots. |
+| `bootloader info` | Displays the installed Gecko Bootloader type and version. |
+| `bootloader reboot` | Reboots the adapter into Gecko Bootloader firmware download mode. |
+| `network leave` | Leaves the current Zigbee network. |
+| `plugin network-steering start 0` | Starts Zigbee network steering (pairing) to join an open network. |
+
+### Building via GitHub Actions & Flashing
+
+1. **Automated Cloud Build (GitHub Actions)**:
+   - Pushing to a branch or opening a pull request triggers `.github/workflows/build.yaml`, which builds all manifests in `manifests/` (including `manifests/sonoff/zbdonglee_zigbee_router.yaml`) using the prebuilt Docker container image.
+   - Once the workflow completes, download the `.gbl` artifact (e.g. `firmware-build-zbdonglee_zigbee_router_8.0.3.0_115200` -> `zbdonglee_zigbee_router_8.0.3.0_115200.gbl`) from the **Actions** tab on GitHub.
+2. **Flashing the `.gbl` Firmware**:
+   - **Browser Web Flasher**: Open [SONOFF Dongle Flasher](https://dongle.sonoff.tech/sonoff-dongle-flasher/) or [SL Web Flasher](https://darkxst.github.io/silabs-firmware-builder/) in Chrome/Edge, connect to the dongle, choose **Change Firmware -> Custom Firmware**, and select `zbdonglee_zigbee_router_8.0.3.0_115200.gbl`.
+   - **Command Line**:
+     ```sh
+     universal-silabs-flasher --device COMx flash --firmware zbdonglee_zigbee_router_8.0.3.0_115200.gbl
+     ```
 
 
 ## Building locally with VSCode

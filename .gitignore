@@ -11,6 +11,7 @@ autogen/
 build/
 artifact/
 artifacts/
+*.gbl
 trashed_modified_files/
 src/**/*.bak
 misc/**/*.bak
