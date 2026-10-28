@@ -171,6 +171,16 @@ static bool get_configured_custom_eui64(sl_802154_long_addr_t out_eui64)
   return false;
 }
 
+// Strong implementation called by the Zigbee stack during sl_zigbee_init()
+// to override the hardware EUI64 with a custom EUI64 from NVM3 or USERDATA.
+void sl_zigbee_get_restored_eui64(sl_802154_long_addr_t eui64)
+{
+  sl_802154_long_addr_t custom_eui64;
+  if (get_configured_custom_eui64(custom_eui64)) {
+    memcpy(eui64, custom_eui64, EUI64_SIZE);
+  }
+}
+
 static void ensure_custom_eui64_and_router_state(void)
 {
   tokTypeStackNodeData node_data;
@@ -178,7 +188,7 @@ static void ensure_custom_eui64_and_router_state(void)
   halCommonGetToken(&node_data, TOKEN_STACK_NODE_DATA);
 
   // If NVRAM still holds coordinator/non-router network state (for example when
-  // repurposing a former coordinator as a router), factory-reset stack tokens
+  // repurposing a former coordinator as a router), reset TOKEN_STACK_NODE_DATA
   // while preserving any custom EUI64 stored in NVM3/USERDATA.
   if (node_data.panId != 0xFFFF
       && node_data.nodeType != SL_ZIGBEE_ROUTER
@@ -186,7 +196,8 @@ static void ensure_custom_eui64_and_router_state(void)
     sl_802154_long_addr_t saved_eui64;
     bool has_custom = get_configured_custom_eui64(saved_eui64);
 
-    sl_zigbee_token_factory_reset(true, true);
+    tokTypeStackNodeData default_node_data = { 0xFFFF, -1, 0, 0x00, 0x00, 0x0000 };
+    halCommonSetToken(TOKEN_STACK_NODE_DATA, &default_node_data);
 
     if (has_custom) {
       halCommonSetToken(TOKEN_STACK_RESTORED_EUI64, &saved_eui64);
